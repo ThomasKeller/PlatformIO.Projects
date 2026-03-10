@@ -1,1 +1,4 @@
 # PlatformIO.Projects
+
+PlatformIO is a cross-platform, cross-architecture, multiple framework, professional tool for embedded systems engineers and for software developers who write applications for embedded products.
+[PlatformIO](https://docs.platformio.org)
