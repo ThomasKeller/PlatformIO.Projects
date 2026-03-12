@@ -13,7 +13,7 @@
 #define WIFI_SSID       "YOUR_WIFI_SSID"
 #define WIFI_PASSWORD   "YOUR_WIFI_PASSWORD"
 
-#define MQTT_BROKER     "192.168.111.100"
+#define MQTT_BROKER     "192.168.111.47"
 #define MQTT_PORT       1883
 #define MQTT_CLIENT_ID  "ehz-esp8266"
 // Optional credentials – leave empty strings if broker has no auth
@@ -21,12 +21,14 @@
 #define MQTT_PASSWORD   ""
 
 // MQTT topics (values are published as plain ASCII numbers)
+#define TOPIC_STATUS     "ehz/status"
 #define TOPIC_CONSUMED1  "ehz/energy/consumed1"   // kWh
 #define TOPIC_PRODUCED1  "ehz/energy/produced1"   // kWh
 #define TOPIC_CONSUMED2  "ehz/energy/consumed2"   // kWh
 #define TOPIC_PRODUCED2  "ehz/energy/produced2"   // kWh
 #define TOPIC_POWER      "ehz/power/current"      // W
 #define TOPIC_JSON       "ehz/energy/json"
+#define TOPIC_UPTIME     "ehz/uptime/ms" // ms since epoch of the measurement
 
 // ---------------------------------------------------------------------------
 // SoftwareSerial pins for the EHZ meter (D5 = GPIO14 RX, D6 = GPIO12 TX)
@@ -80,10 +82,10 @@ void publishMeasurementJson(const EhZMeasurement& m) {
                "\"valid\":%s}";
     // Energies are published as kWh in JSON (same unit as scalar topics)
     int n = snprintf(payload, sizeof(payload), t,
-        m.consumedEnergy1 / 1000.0,
-        m.consumedEnergy2 / 1000.0,
-        m.producedEnergy1 / 1000.0,
-        m.producedEnergy2 / 1000.0,
+        m.consumedEnergy1,
+        m.consumedEnergy2,
+        m.producedEnergy1,
+        m.producedEnergy2,
         m.currentPower,
         m.valid ? "true" : "false");
 
@@ -109,13 +111,28 @@ bool connectMqtt() {
 
     bool ok;
     if (strlen(MQTT_USER) > 0) {
-        ok = mqttClient.connect(MQTT_CLIENT_ID, MQTT_USER, MQTT_PASSWORD);
+        ok = mqttClient.connect(
+            MQTT_CLIENT_ID,
+            MQTT_USER,
+            MQTT_PASSWORD,
+            TOPIC_STATUS,   // will topic
+            1,              // will QoS
+            true,           // will retained
+            "stopped"       // will payload
+        );
     } else {
-        ok = mqttClient.connect(MQTT_CLIENT_ID);
+        ok = mqttClient.connect(
+            MQTT_CLIENT_ID,
+            TOPIC_STATUS,   // will topic
+            1,              // will QoS
+            true,           // will retained
+            "stopped"       // will payload
+        );
     }
 
     if (ok) {
         Serial.println(F("connected."));
+        mqttClient.publish(TOPIC_STATUS, "started", true);
     } else {
         Serial.print(F("failed, rc="));
         Serial.println(mqttClient.state());
@@ -190,19 +207,19 @@ void loop() {
             bool publishedAny = false;
 
             if (dbConsumed1.addValue(now, m.consumedEnergy1, diff)) {
-                publishFloat(TOPIC_CONSUMED1, m.consumedEnergy1 / 1000.0);
+                publishFloat(TOPIC_CONSUMED1, m.consumedEnergy1);
                 publishedAny = true;
             }
             if (dbProduced1.addValue(now, m.producedEnergy1, diff)) {
-                publishFloat(TOPIC_PRODUCED1, m.producedEnergy1 / 1000.0);
+                publishFloat(TOPIC_PRODUCED1, m.producedEnergy1);
                 publishedAny = true;
             }
             if (dbConsumed2.addValue(now, m.consumedEnergy2, diff)) {
-                publishFloat(TOPIC_CONSUMED2, m.consumedEnergy2 / 1000.0);
+                publishFloat(TOPIC_CONSUMED2, m.consumedEnergy2);
                 publishedAny = true;
             }
             if (dbProduced2.addValue(now, m.producedEnergy2, diff)) {
-                publishFloat(TOPIC_PRODUCED2, m.producedEnergy2 / 1000.0);
+                publishFloat(TOPIC_PRODUCED2, m.producedEnergy2);
                 publishedAny = true;
             }
             if (dbPower.addValue(now, m.currentPower, diff)) {
@@ -211,6 +228,7 @@ void loop() {
             }
             if (publishedAny) {
                 publishMeasurementJson(m);
+                mqttClient.publish(TOPIC_UPTIME, String(now).c_str(), true);
             }
         }
     }
