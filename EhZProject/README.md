@@ -26,16 +26,44 @@ Note: this disables the debug output on the same port.
 
 ## Configuration
 
+### Wi-Fi
+
 Edit the `#define` constants at the top of `src/main.cpp`:
 
 ```cpp
 #define WIFI_SSID      "your-ssid"
 #define WIFI_PASSWORD  "your-password"
+```
 
-#define MQTT_BROKER    "192.168.1.100"   // IP or hostname of your broker
-#define MQTT_PORT      1883
-#define MQTT_USER      ""                // leave empty if no auth
-#define MQTT_PASSWORD  ""
+### MQTT (compile-time defaults + web UI)
+
+The MQTT broker address, port, username and password can be configured in two
+ways:
+
+1. **Compile-time defaults** – edit the `MQTT_BROKER_DEFAULT` / `MQTT_PORT_DEFAULT`
+   / `MQTT_USER_DEFAULT` / `MQTT_PASS_DEFAULT` defines in `src/main.cpp` before
+   flashing.  These are only used when the EEPROM has never been written.
+
+2. **Web UI** – after the device boots and connects to Wi-Fi, open
+   `http://<device-ip>/config` in a browser.  Fill in the fields and click
+   **Save & Apply**.  The settings are written to EEPROM and survive power
+   cycles and resets.
+
+---
+
+## Web Dashboard
+
+A built-in HTTP server runs on port 80 and provides two pages:
+
+| URL | Description |
+|-----|-------------|
+| `http://<ip>/`       | Live dashboard: current meter readings + uptime + MQTT status (auto-refreshes every 10 s) |
+| `http://<ip>/config` | MQTT settings form (host, port, user, password) |
+
+The device IP address is printed to the serial monitor on every boot:
+
+```
+[Web] Server started at http://192.168.x.y
 ```
 
 ---
