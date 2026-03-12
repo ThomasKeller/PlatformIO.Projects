@@ -13,7 +13,7 @@
 #define WIFI_SSID       "YOUR_WIFI_SSID"
 #define WIFI_PASSWORD   "YOUR_WIFI_PASSWORD"
 
-#define MQTT_BROKER     "192.168.1.100"
+#define MQTT_BROKER     "192.168.111.100"
 #define MQTT_PORT       1883
 #define MQTT_CLIENT_ID  "ehz-esp8266"
 // Optional credentials – leave empty strings if broker has no auth
@@ -26,6 +26,7 @@
 #define TOPIC_CONSUMED2  "ehz/energy/consumed2"   // kWh
 #define TOPIC_PRODUCED2  "ehz/energy/produced2"   // kWh
 #define TOPIC_POWER      "ehz/power/current"      // W
+#define TOPIC_JSON       "ehz/energy/json"
 
 // ---------------------------------------------------------------------------
 // SoftwareSerial pins for the EHZ meter (D5 = GPIO14 RX, D6 = GPIO12 TX)
@@ -65,6 +66,33 @@ void publishFloat(const char* topic, double value) {
     if (!mqttClient.publish(topic, buf, /*retained=*/true)) {
         Serial.print(F("[MQTT] publish failed for topic: "));
         Serial.println(topic);
+    }
+}
+
+void publishMeasurementJson(const EhZMeasurement& m) {
+    char payload[220];
+
+    const char* t = "{\"consumedEnergy1\":%.4f,"
+               "\"consumedEnergy2\":%.4f,"
+               "\"producedEnergy1\":%.4f,"
+               "\"producedEnergy2\":%.4f,"
+               "\"currentPower\":%.1f,"  
+               "\"valid\":%s}";
+    // Energies are published as kWh in JSON (same unit as scalar topics)
+    int n = snprintf(payload, sizeof(payload), t,
+        m.consumedEnergy1 / 1000.0,
+        m.consumedEnergy2 / 1000.0,
+        m.producedEnergy1 / 1000.0,
+        m.producedEnergy2 / 1000.0,
+        m.currentPower,
+        m.valid ? "true" : "false");
+
+    if (n <= 0 || n >= (int)sizeof(payload)) {
+        Serial.println(F("[MQTT] JSON payload truncated/invalid"));
+        return;
+    }
+    if (!mqttClient.publish(TOPIC_JSON, payload, true)) {
+        Serial.println(F("[MQTT] publish failed for JSON topic"));
     }
 }
 
@@ -159,17 +187,31 @@ void loop() {
         if (m.valid && mqttClient.connected()) {
             unsigned long now = millis();
             double diff = 0.0;
+            bool publishedAny = false;
 
-            if (dbConsumed1.addValue(now, m.consumedEnergy1, diff))
+            if (dbConsumed1.addValue(now, m.consumedEnergy1, diff)) {
                 publishFloat(TOPIC_CONSUMED1, m.consumedEnergy1 / 1000.0);
-            if (dbProduced1.addValue(now, m.producedEnergy1, diff))
+                publishedAny = true;
+            }
+            if (dbProduced1.addValue(now, m.producedEnergy1, diff)) {
                 publishFloat(TOPIC_PRODUCED1, m.producedEnergy1 / 1000.0);
-            if (dbConsumed2.addValue(now, m.consumedEnergy2, diff))
+                publishedAny = true;
+            }
+            if (dbConsumed2.addValue(now, m.consumedEnergy2, diff)) {
                 publishFloat(TOPIC_CONSUMED2, m.consumedEnergy2 / 1000.0);
-            if (dbProduced2.addValue(now, m.producedEnergy2, diff))
+                publishedAny = true;
+            }
+            if (dbProduced2.addValue(now, m.producedEnergy2, diff)) {
                 publishFloat(TOPIC_PRODUCED2, m.producedEnergy2 / 1000.0);
-            if (dbPower.addValue(now, m.currentPower, diff))
+                publishedAny = true;
+            }
+            if (dbPower.addValue(now, m.currentPower, diff)) {
                 publishFloat(TOPIC_POWER, m.currentPower);
+                publishedAny = true;
+            }
+            if (publishedAny) {
+                publishMeasurementJson(m);
+            }
         }
     }
 
