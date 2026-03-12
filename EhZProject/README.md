@@ -2,7 +2,7 @@
 
 ESP8266 (NodeMCU v2) PlatformIO project that reads energy-consumption data
 from an EHZ Smart Meter via the SML protocol over a serial port and publishes
-the readings to an MQTT broker.
+the readings to a [NATS](https://nats.io) server.
 
 ---
 
@@ -29,39 +29,58 @@ Note: this disables the debug output on the same port.
 Edit the `#define` constants at the top of `src/main.cpp`:
 
 ```cpp
-#define WIFI_SSID      "your-ssid"
-#define WIFI_PASSWORD  "your-password"
+#define WIFI_SSID        "your-ssid"
+#define WIFI_PASSWORD    "your-password"
 
-#define MQTT_BROKER    "192.168.1.100"   // IP or hostname of your broker
-#define MQTT_PORT      1883
-#define MQTT_USER      ""                // leave empty if no auth
-#define MQTT_PASSWORD  ""
+#define NATS_SERVER      "192.168.1.100"   // IP or hostname of your NATS server
+#define NATS_PORT        4222              // default NATS port
+#define NATS_CLIENT_NAME "ehz-esp8266"
+#define NATS_USER        ""               // leave empty if no auth
+#define NATS_PASSWORD    ""
 ```
 
 ---
 
-## MQTT topics
+## NATS subjects
 
 All energy values are published in **kWh**; power in **W**.
-Values are retained on the broker.
 
-| Topic                   | Unit | OBIS    | Description                  |
-|-------------------------|------|---------|------------------------------|
-| `ehz/energy/consumed1`  | kWh  | 1.8.0   | Consumed energy tariff 1     |
-| `ehz/energy/produced1`  | kWh  | 2.8.0   | Produced energy tariff 1     |
-| `ehz/energy/consumed2`  | kWh  | 1.8.1   | Consumed energy tariff 2     |
-| `ehz/energy/produced2`  | kWh  | 2.8.1   | Produced energy tariff 2     |
-| `ehz/power/current`     | W    | 16.7.0  | Current active power         |
+| Subject                   | Unit | OBIS    | Description                  |
+|---------------------------|------|---------|------------------------------|
+| `ehz.energy.consumed1`    | kWh  | 1.8.0   | Consumed energy tariff 1     |
+| `ehz.energy.produced1`    | kWh  | 2.8.0   | Produced energy tariff 1     |
+| `ehz.energy.consumed2`    | kWh  | 1.8.1   | Consumed energy tariff 2     |
+| `ehz.energy.produced2`    | kWh  | 2.8.1   | Produced energy tariff 2     |
+| `ehz.power.current`       | W    | 16.7.0  | Current active power         |
+| `ehz.energy.json`         | —    | all     | All values as a JSON object  |
+
+> **Note:** NATS does not support retained messages. Subscribers must be
+> online at the time a message is published to receive it.
 
 ---
 
 ## Rate limiting (dead-band)
 
-To avoid flooding the broker, each value is subject to a dead-band:
+To avoid flooding the server, each value is subject to a dead-band:
 
-- **Minimum interval**: 15 seconds between any two publishes of the same topic.
+- **Minimum interval**: 15 seconds between any two publishes of the same subject.
 - **Force publish**: even if the value has not changed, it is republished after
   10 minutes to confirm the reading is still live.
+
+---
+
+## NATS protocol
+
+The firmware implements the [NATS client protocol](https://docs.nats.io/reference/reference-protocols/nats-protocol)
+directly over a plain TCP `WiFiClient` connection — no additional library is
+required:
+
+1. On connect the server sends an `INFO` JSON line.
+2. The firmware replies with a `CONNECT` JSON command (credentials included
+   when `NATS_USER` is non-empty).
+3. Values are published with `PUB subject nbytes\r\npayload\r\n`.
+4. Incoming `PING` messages from the server are answered with `PONG` to keep
+   the connection alive.
 
 ---
 
@@ -78,5 +97,6 @@ pio device monitor             # serial monitor at 115200 baud
 
 ## Dependencies
 
-- [knolleary/PubSubClient](https://github.com/knolleary/pubsubclient) `^2.8`
-  — MQTT client for Arduino/ESP8266.
+No external libraries are required beyond the ESP8266 Arduino core
+(`ESP8266WiFi`, `SoftwareSerial`) which is provided by the
+`espressif8266` PlatformIO platform.
