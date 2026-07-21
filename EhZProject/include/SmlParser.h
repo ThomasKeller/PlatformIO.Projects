@@ -50,11 +50,13 @@ public:
     }
 
     // Diagnostics: how many complete SML telegrams (start+stop framing
-    // found) have been seen, and how many of those were valid (consumed AND
-    // produced could be decoded). A gap between the two while bytes are
-    // clearly arriving points at a framing/OBIS mismatch rather than a wiring
-    // problem.
+    // found) have been seen, how many failed the CRC16 check (dropped/
+    // corrupted bytes - e.g. from SoftwareSerial buffer overruns under WiFi
+    // load), and how many of the CRC-valid ones actually decoded (consumed
+    // AND produced found). A gap between "found" and "valid" while bytes are
+    // clearly arriving points at a framing/OBIS mismatch or a noisy link.
     unsigned long telegramsFound() const { return _telegramsFound; }
+    unsigned long telegramsCrcFailed() const { return _telegramsCrcFailed; }
     unsigned long telegramsValid() const { return _telegramsValid; }
 
     // ----------------------------------------------------------------
@@ -126,7 +128,24 @@ private:
     EhZMeasurement       _meas;
     bool                 _ready;
     unsigned long        _telegramsFound = 0;
+    unsigned long        _telegramsCrcFailed = 0;
     unsigned long        _telegramsValid = 0;
+
+    // CRC16/X-25 (poly 0x8408 reflected, init 0xFFFF, final XOR 0xFFFF),
+    // as used by SML's end-of-transmission trailer. Verified against real
+    // capture data: this exact variant, with the trailer's 2 CRC bytes
+    // little-endian, matches the meter's own checksum.
+    static uint16_t crc16X25(const uint8_t* data, int len) {
+        uint16_t crc = 0xFFFF;
+        for (int i = 0; i < len; i++) {
+            crc ^= data[i];
+            for (int b = 0; b < 8; b++) {
+                if (crc & 0x0001) crc = (uint16_t)((crc >> 1) ^ 0x8408);
+                else crc = (uint16_t)(crc >> 1);
+            }
+        }
+        return (uint16_t)(crc ^ 0xFFFF);
+    }
 
     // Shared implementation behind convertTo()/readNumeric(): only sign-extends
     // when the field is actually a signed SML Integer, so a large Unsigned
@@ -232,22 +251,40 @@ private:
                                      startPos + (int)sizeof(SEQ_START));
         if (stopPos < 0) return;  // message not yet complete
 
-        int msgEnd = stopPos + (int)sizeof(SEQ_STOP);
+        // The stop escape is followed by a fixed 4-byte trailer:
+        // 0x1A, a fill-byte count, then a little-endian CRC16 covering
+        // everything from SEQ_START through the fill-byte count (inclusive).
+        // Wait for all of it to arrive before deciding anything.
+        int trailerStart = stopPos + (int)sizeof(SEQ_STOP);
+        int msgEnd = trailerStart + 4;
+        if (msgEnd > dataLen) return;  // trailer not fully arrived yet
+
         _telegramsFound++;
 
-        // We have a complete message: data[startPos..msgEnd-1]
+        uint16_t embeddedCrc = (uint16_t)(data[trailerStart + 2] | (data[trailerStart + 3] << 8));
+        uint16_t computedCrc = crc16X25(data + startPos, (trailerStart + 2) - startPos);
+
+        if (computedCrc != embeddedCrc) {
+            // Corrupted telegram (e.g. bytes dropped under WiFi/CPU load) -
+            // discard rather than risk decoding garbage as a real reading.
+            _telegramsCrcFailed++;
+            _buf.erase(_buf.begin(), _buf.begin() + msgEnd);
+            return;
+        }
+
+        // We have a complete, CRC-valid message: data[startPos..trailerStart-1]
         EhZMeasurement m;
         bool ok = true;
 
-        ok &= searchAndParse(data, msgEnd, startPos,
+        ok &= searchAndParse(data, trailerStart, startPos,
                              SEQ_CONSUMED, sizeof(SEQ_CONSUMED), m.consumedEnergy);
-        ok &= searchAndParse(data, msgEnd, startPos,
+        ok &= searchAndParse(data, trailerStart, startPos,
                              SEQ_PRODUCED, sizeof(SEQ_PRODUCED), m.producedEnergy);
 
         // Power is optional: not every meter sends OBIS 16.7.0. Its absence
         // must not invalidate the whole measurement; currentPower simply
         // stays at its default (0.0) if not found.
-        searchAndParse(data, msgEnd, startPos,
+        searchAndParse(data, trailerStart, startPos,
                        SEQ_POWER, sizeof(SEQ_POWER), m.currentPower);
 
         if (ok) {

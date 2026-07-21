@@ -1,4 +1,13 @@
 #include <Arduino.h>
+
+// IotWebConf's default WiFi password buffer is only 33 bytes (32 usable
+// characters). WPA2-PSK allows up to 63 characters, and router-generated
+// passwords (e.g. UniFi defaults) commonly exceed 32 - without this override
+// a longer password gets silently truncated on save, so the device keeps
+// "correctly" retrying a wrong (truncated) password and falls back to its
+// own AP. Must be defined before including IotWebConf.h.
+#define IOTWEBCONF_PASSWORD_LEN 65
+
 #include <ESP8266WiFi.h>
 #include <DNSServer.h>
 #include <IotWebConf.h>
@@ -22,7 +31,7 @@
 // ---------------------------------------------------------------------------
 const char THING_NAME[]                = "ehz-esp8266";
 const char WIFI_INITIAL_AP_PASSWORD[]  = "ehzsetup";
-#define CONFIG_VERSION "ehz1"  // bump when the parameter set below changes
+#define CONFIG_VERSION "ehz2"  // bump when the parameter set/layout below changes
 
 #define MQTT_SERVER_LEN   128
 #define MQTT_PORT_LEN     8
@@ -65,13 +74,18 @@ IotWebConfCheckboxParameter debugTcpEnabledParam(
 #define TOPIC_UPTIME     "ehz/uptime/ms" // ms since epoch of the measurement
 
 // ---------------------------------------------------------------------------
-// SoftwareSerial pins for the EHZ meter (D5 = GPIO14 RX, D6 = GPIO12 TX)
-// Change to USE_HARDWARE_SERIAL if you want UART0 for the meter and disable
-// the debug Serial output.
+// Meter serial: hardware UART0 (D9=RX0/GPIO3, D10=TX0/GPIO1) is used by
+// default rather than SoftwareSerial (D5/D6). Measured on real hardware:
+// SoftwareSerial had a 47% CRC failure rate (220/468 telegrams) under
+// WiFi+webserver load, since bit-banged reception is sensitive to interrupt
+// jitter; switching to hardware UART - same read head, same alignment -
+// dropped that to ~2% (2/104). Comment out USE_HARDWARE_SERIAL to fall back
+// to SoftwareSerial on D5/D6 if you need the pins or the USB debug output
+// for something else.
 // ---------------------------------------------------------------------------
-// #define USE_HARDWARE_SERIAL
-#define METER_RX_PIN  14  // D5
-#define METER_TX_PIN  12  // D6
+#define USE_HARDWARE_SERIAL
+#define METER_RX_PIN  14  // D5 (only used by the SoftwareSerial fallback)
+#define METER_TX_PIN  12  // D6 (only used by the SoftwareSerial fallback)
 
 // Many DIY IR read heads (phototransistor + pull-up) output an inverted
 // signal relative to normal TTL UART levels. If /debug shows bytes arriving
@@ -187,11 +201,23 @@ void publishMeasurementJson(const EhZMeasurement& m) {
 }
 
 // Called by IotWebConf right after new settings are persisted to EEPROM.
+// IotWebConf itself does not reboot after a save - it relies on its state
+// machine picking up new WiFi settings during normal operation, which is
+// unreliable to depend on (that's what left the device unreachable after a
+// WiFi credential typo). Restarting explicitly makes "save -> reboot ->
+// reconnect with new settings" deterministic. The actual restart happens a
+// little later from loop(), so the "saved" confirmation page the browser is
+// waiting for has time to be sent first.
+bool restartPending = false;
+unsigned long restartAtMs = 0;
+
 void configSaved() {
-    Serial.println(F("[Config] Saved - reconnecting MQTT with new settings"));
+    Serial.println(F("[Config] Saved - restarting to apply new settings"));
     mqttClient.disconnect();
     mqttClient.setServer(mqttServerValue, atoi(mqttPortValue));
     updateRawTcpServerState();
+    restartPending = true;
+    restartAtMs = millis() + 1500;
 }
 
 bool connectMqtt() {
@@ -238,83 +264,185 @@ bool connectMqtt() {
 }
 
 // ---------------------------------------------------------------------------
+// WiFi/IotWebConf diagnostics
+// ---------------------------------------------------------------------------
+const char* networkStateName(iotwebconf::NetworkState state) {
+    switch (state) {
+        case iotwebconf::Boot:          return "Startet";
+        case iotwebconf::NotConfigured: return "Nicht konfiguriert";
+        case iotwebconf::ApMode:        return "Setup-Netz aktiv (AP-Modus)";
+        case iotwebconf::Connecting:    return "Verbinde mit WLAN...";
+        case iotwebconf::OnLine:        return "Online";
+        case iotwebconf::OffLine:       return "Offline";
+        default:                       return "Unbekannt";
+    }
+}
+
+// wl_status_t values, in particular WL_CONNECT_FAILED, is the ESP8266's own
+// signal for "auth/handshake failed" - i.e. almost always a wrong password
+// (as opposed to WL_NO_SSID_AVAIL, which means the network name itself
+// wasn't found/visible).
+const char* wifiStatusName(wl_status_t status) {
+    switch (status) {
+        case WL_IDLE_STATUS:     return "Leerlauf";
+        case WL_NO_SSID_AVAIL:   return "SSID nicht gefunden (Name falsch oder außer Reichweite)";
+        case WL_SCAN_COMPLETED:  return "Scan abgeschlossen";
+        case WL_CONNECTED:       return "Verbunden";
+        case WL_CONNECT_FAILED:  return "Fehlgeschlagen (häufigste Ursache: falsches Passwort)";
+        case WL_CONNECTION_LOST: return "Verbindung verloren";
+        case WL_DISCONNECTED:    return "Getrennt";
+        default:                return "Unbekannt";
+    }
+}
+
+// Logs to Serial only when the WiFi/IotWebConf state actually changes, so the
+// serial monitor builds a readable history of connection attempts over time
+// instead of one line per loop() iteration.
+iotwebconf::NetworkState lastLoggedState  = (iotwebconf::NetworkState)255;
+wl_status_t              lastLoggedWifi   = (wl_status_t)255;
+
+void logWifiStateChanges() {
+    iotwebconf::NetworkState state = iotWebConf.getState();
+    wl_status_t wifiStatus = WiFi.status();
+
+    if (state != lastLoggedState || wifiStatus != lastLoggedWifi) {
+        Serial.print(F("[WiFi] t="));
+        Serial.print(millis() / 1000UL);
+        Serial.print(F("s state="));
+        Serial.print(networkStateName(state));
+        Serial.print(F(" wifi="));
+        Serial.print(wifiStatusName(wifiStatus));
+        Serial.print(F(" (code "));
+        Serial.print((int)wifiStatus);
+        Serial.println(F(")"));
+        lastLoggedState = state;
+        lastLoggedWifi  = wifiStatus;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Web pages
 // ---------------------------------------------------------------------------
+
+// Shared look for all our own pages (not IotWebConf's own /config UI).
+// Light/dark aware via CSS custom properties + prefers-color-scheme.
+const char PAGE_STYLE[] =
+    ":root{--bg:#f4f6f8;--card:#ffffff;--text:#1c2530;--muted:#6b7785;"
+    "--accent:#2f6feb;--ok:#1f9d55;--bad:#d64545;--border:#e2e6ea;}"
+    "@media (prefers-color-scheme:dark){:root{--bg:#14181d;--card:#1c2229;"
+    "--text:#e6e9ec;--muted:#8a939d;--border:#2b323a;}}"
+    "*{box-sizing:border-box;}"
+    "body{margin:0;font-family:-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;"
+    "background:var(--bg);color:var(--text);}"
+    "header{background:var(--card);border-bottom:1px solid var(--border);"
+    "padding:0.9em 1.2em;display:flex;align-items:center;gap:1em;flex-wrap:wrap;}"
+    "header strong{font-size:1.05em;}"
+    "nav a{color:var(--muted);text-decoration:none;margin-right:1em;font-size:0.92em;}"
+    "nav a:hover{color:var(--accent);}"
+    "main{max-width:720px;margin:1.5em auto;padding:0 1em;}"
+    ".card{background:var(--card);border:1px solid var(--border);border-radius:10px;"
+    "padding:1.1em 1.3em;margin-bottom:1.1em;}"
+    "h1{font-size:1.2em;margin:0 0 0.6em;}"
+    "table{border-collapse:collapse;width:100%;}"
+    "th,td{padding:0.5em 0.6em;text-align:left;border-bottom:1px solid var(--border);font-size:0.93em;}"
+    "th{color:var(--muted);font-weight:600;}"
+    "td.num,th.num{text-align:right;}"
+    ".badge{display:inline-block;padding:0.15em 0.6em;border-radius:999px;font-size:0.85em;font-weight:600;}"
+    ".badge.ok{background:rgba(31,157,85,0.15);color:var(--ok);}"
+    ".badge.bad{background:rgba(214,69,69,0.15);color:var(--bad);}"
+    "pre{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:0.8em;"
+    "overflow-x:auto;white-space:pre-wrap;word-break:break-all;font-size:0.82em;}"
+    ".muted{color:var(--muted);font-size:0.88em;}"
+    "a.btn{display:inline-block;background:var(--accent);color:#fff;padding:0.5em 1em;"
+    "border-radius:8px;text-decoration:none;font-size:0.92em;margin:0.2em 0.4em 0.2em 0;}"
+    "a.btn.secondary{background:transparent;color:var(--accent);border:1px solid var(--accent);}";
+
+String htmlHead(const char* title, int refreshSeconds = 0) {
+    String h = "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+               "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+    if (refreshSeconds > 0) {
+        h += "<meta http-equiv='refresh' content='" + String(refreshSeconds) + "'>";
+    }
+    h += "<title>" + String(title) + "</title><style>" + String(PAGE_STYLE) +
+         "</style></head><body>"
+         "<header><strong>&#9889; EhZ Smart Meter</strong><nav>"
+         "<a href='/'>Start</a><a href='/values'>Messwerte</a>"
+         "<a href='/debug'>Debug</a><a href='/config'>Konfiguration</a>"
+         "</nav></header><main>";
+    return h;
+}
+
+String htmlFoot() {
+    return "</main></body></html>";
+}
+
 void handleRoot() {
     if (iotWebConf.handleCaptivePortal()) return;  // captive portal redirect
 
-    String page =
-        "<!DOCTYPE html><html><head><meta charset='utf-8'>"
-        "<title>EhZ Smart Meter</title></head><body>"
-        "<h1>EhZ Smart Meter</h1>"
-        "<p><a href='/values'>Aktuelle Messwerte</a></p>"
-        "<p><a href='/debug'>Debug-Informationen</a></p>"
-        "<p><a href='config'>Konfiguration (WLAN / MQTT)</a></p>"
-        "</body></html>";
+    String page = htmlHead("EhZ Smart Meter");
+    page += "<div class='card'>"
+            "<h1>EhZ Smart Meter</h1>"
+            "<p class='muted'>ESP8266-Auslesung f&uuml;r deinen Stromz&auml;hler "
+            "&uuml;ber die optische SML-Schnittstelle.</p>"
+            "<p>"
+            "<a class='btn' href='/values'>Aktuelle Messwerte</a>"
+            "<a class='btn secondary' href='/debug'>Debug-Informationen</a>"
+            "<a class='btn secondary' href='/config'>Konfiguration</a>"
+            "</p></div>";
+    page += htmlFoot();
     server.send(200, "text/html; charset=utf-8", page);
 }
 
 void handleValues() {
-    String page =
-        "<!DOCTYPE html><html><head><meta charset='utf-8'>"
-        "<meta http-equiv='refresh' content='15'>"
-        "<title>EhZ - Messwerte</title>"
-        "<style>"
-        "body{font-family:sans-serif;margin:1.5em;}"
-        "table{border-collapse:collapse;}"
-        "th,td{border:1px solid #ccc;padding:4px 10px;text-align:right;}"
-        "th{background:#eee;}"
-        "</style></head><body>"
-        "<h1>Aktuelle Messwerte</h1>"
-        "<p><a href='/'>zur&uuml;ck</a></p>";
+    String page = htmlHead("EhZ - Messwerte", 15);
+    page += "<div class='card'><h1>Aktuelle Messwerte</h1>";
 
     if (history.count() == 0) {
-        page += "<p>Noch keine Messung empfangen.</p>";
+        page += "<p class='muted'>Noch keine Messung empfangen.</p>";
     } else {
-        page += "<table><tr><th>Alter (s)</th><th>Verbrauch (kWh)</th>"
-                "<th>Einspeisung (kWh)</th><th>Leistung (W)</th></tr>";
-        unsigned long now = millis();
-        char row[160];
+        page += "<table><tr><th>Uptime (s)</th><th class='num'>Verbrauch (kWh)</th>"
+                "<th class='num'>Einspeisung (kWh)</th><th class='num'>Leistung (W)</th></tr>";
+        char row[200];
         for (int i = 0; i < history.count(); i++) {
             const MeasurementHistory<HISTORY_SIZE>::Entry& e = history.get(i);
-            unsigned long ageS = (now - e.uptimeMs) / 1000UL;
+            unsigned long uptimeS = e.uptimeMs / 1000UL;
             snprintf(row, sizeof(row),
-                "<tr><td>%lu</td><td>%.3f</td><td>%.3f</td><td>%.1f</td></tr>",
-                ageS, e.consumedEnergy / 1000.0, e.producedEnergy / 1000.0, e.currentPower);
+                "<tr><td>%lu</td><td class='num'>%.3f</td><td class='num'>%.3f</td>"
+                "<td class='num'>%.1f</td></tr>",
+                uptimeS, e.consumedEnergy / 1000.0, e.producedEnergy / 1000.0, e.currentPower);
             page += row;
         }
         page += "</table>";
     }
-    page += "</body></html>";
+    page += "</div>";
+    page += htmlFoot();
     server.send(200, "text/html; charset=utf-8", page);
 }
 
 void handleDebug() {
     unsigned long now = millis();
+    bool wifiOk = (WiFi.status() == WL_CONNECTED);
+    bool mqttOk = mqttClient.connected();
+    bool crcHealthy = smlParser.telegramsCrcFailed() == 0;
 
-    String page =
-        "<!DOCTYPE html><html><head><meta charset='utf-8'>"
-        "<meta http-equiv='refresh' content='10'>"
-        "<title>EhZ - Debug</title>"
-        "<style>"
-        "body{font-family:sans-serif;margin:1.5em;}"
-        "table{border-collapse:collapse;margin-bottom:1em;}"
-        "th,td{border:1px solid #ccc;padding:4px 10px;text-align:left;}"
-        "th{background:#eee;}"
-        "pre{background:#f5f5f5;padding:0.8em;overflow-x:auto;white-space:pre-wrap;word-break:break-all;}"
-        "</style></head><body>"
-        "<h1>Debug</h1>"
-        "<p><a href='/'>zur&uuml;ck</a></p>"
-        "<table>";
+    String page = htmlHead("EhZ - Debug", 10);
+    page += "<div class='card'><h1>Debug</h1><table>";
 
-    page += "<tr><th>WLAN</th><td>";
-    page += (WiFi.status() == WL_CONNECTED) ? "verbunden" : "getrennt";
-    page += " (" + WiFi.SSID() + ", " + String(WiFi.RSSI()) + " dBm, IP " +
+    page += "<tr><th>WLAN</th><td><span class='badge ";
+    page += wifiOk ? "ok'>verbunden</span> " : "bad'>getrennt</span> ";
+    page += "(" + WiFi.SSID() + ", " + String(WiFi.RSSI()) + " dBm, IP " +
             WiFi.localIP().toString() + ")</td></tr>";
 
-    page += "<tr><th>MQTT</th><td>";
-    page += mqttClient.connected() ? "verbunden" : "getrennt";
-    page += " (Broker " + String(mqttServerValue) + ":" + String(mqttPortValue) +
+    page += "<tr><th>IotWebConf-Status</th><td>" +
+            String(networkStateName(iotWebConf.getState())) + "</td></tr>";
+
+    page += "<tr><th>WiFi-Statuscode</th><td>" +
+            String(wifiStatusName(WiFi.status())) +
+            " (Code " + String((int)WiFi.status()) + ")</td></tr>";
+
+    page += "<tr><th>MQTT</th><td><span class='badge ";
+    page += mqttOk ? "ok'>verbunden</span> " : "bad'>getrennt</span> ";
+    page += "(Broker " + String(mqttServerValue) + ":" + String(mqttPortValue) +
             ", rc=" + String(mqttClient.state()) + ")</td></tr>";
 
     page += "<tr><th>Bytes vom Z&auml;hler</th><td>" + String(meterByteCount) +
@@ -322,13 +450,16 @@ void handleDebug() {
             String((now - lastMeterByteMs) / 1000UL) + "s</td></tr>";
 
     page += "<tr><th>Telegramme</th><td>" + String(smlParser.telegramsFound()) +
-            " gefunden, " + String(smlParser.telegramsValid()) + " g&uuml;ltig</td></tr>";
+            " gefunden, <span class='badge " + (crcHealthy ? "ok" : "bad") + "'>" +
+            String(smlParser.telegramsCrcFailed()) + " CRC-Fehler</span>, " +
+            String(smlParser.telegramsValid()) + " g&uuml;ltig</td></tr>";
 
     page += "<tr><th>Freier Heap</th><td>" + String(ESP.getFreeHeap()) + " Bytes</td></tr>";
     page += "<tr><th>Uptime</th><td>" + String(now / 1000UL) + " s</td></tr>";
-    page += "</table>";
+    page += "</table></div>";
 
-    page += "<h2>Letzte Rohbytes vom Z&auml;hler (" + String(rawBufCount) + ")</h2><pre>";
+    page += "<div class='card'><h1>Letzte Rohbytes vom Z&auml;hler (" +
+            String(rawBufCount) + ")</h1><pre>";
     int start = (rawBufHead - rawBufCount + RAW_BUF_SIZE) % RAW_BUF_SIZE;
     char hexByte[4];
     for (int i = 0; i < rawBufCount; i++) {
@@ -336,18 +467,20 @@ void handleDebug() {
         snprintf(hexByte, sizeof(hexByte), "%02X ", rawBuf[idx]);
         page += hexByte;
     }
-    page += "</pre>";
+    page += "</pre></div>";
 
+    page += "<div class='card'>";
     if (rawTcpServerRunning) {
         page += "<p>Kompletter Roh-Bytestrom per TCP: <code>" + WiFi.localIP().toString() +
                 ":" + String(RAW_TCP_PORT) + "</code> "
                 "(z.B. <code>tools/raw_monitor.ps1</code> oder <code>nc</code>)</p>";
     } else {
-        page += "<p>Roh-TCP-Debug ist deaktiviert. Unter "
+        page += "<p class='muted'>Roh-TCP-Debug ist deaktiviert. Unter "
                 "<a href='/config'>/config</a> &rarr; \"Debug-Einstellungen\" aktivieren.</p>";
     }
+    page += "</div>";
 
-    page += "</body></html>";
+    page += htmlFoot();
     server.send(200, "text/html; charset=utf-8", page);
 }
 
@@ -374,7 +507,10 @@ void setup() {
     Serial.begin(9600, SERIAL_8N1, SERIAL_RX_ONLY, 1, METER_SERIAL_INVERTED);
     Serial.println(F("[EhZ] Using hardware serial at 9600 baud"));
 #else
-    meterSerial.begin(9600);
+    // Larger-than-default RX buffer (64 bytes default is thin margin for a
+    // ~300-byte telegram while WiFi/webserver/MQTT compete for CPU time).
+    meterSerial.begin(9600, SWSERIAL_8N1, METER_RX_PIN, METER_TX_PIN,
+                      METER_SERIAL_INVERTED, 256);
     Serial.println(F("[EhZ] SoftwareSerial RX=D5, TX=D6 at 9600 baud"));
 #endif
 
@@ -389,7 +525,28 @@ void setup() {
     iotWebConf.init();
 
     server.on("/", handleRoot);
-    server.on("/config", [] { iotWebConf.handleConfig(); });
+    server.on("/config", [] {
+        // The password field is intentionally always rendered empty (the
+        // stored value is never sent to the browser); set a placeholder so
+        // it's clear a password IS already saved, without revealing it.
+        mqttPasswordParam.placeholder = (strlen(mqttPasswordValue) > 0)
+            ? "******** (gesetzt - leer lassen zum Beibehalten)"
+            : "(kein Passwort gesetzt)";
+
+        // The built-in "AP password" field suffers the exact same "can't
+        // tell if it's set" problem, but with much bigger consequences if
+        // overlooked: if it ends up empty (e.g. after an EEPROM erase),
+        // IotWebConf's mustStayInApMode() permanently refuses to even
+        // attempt joining the configured WiFi, regardless of how correct
+        // those credentials are. Make that impossible to miss.
+        iotwebconf::Parameter* apPasswordParam = iotWebConf.getApPasswordParameter();
+        ((IotWebConfPasswordParameter*)apPasswordParam)->placeholder =
+            (strlen(apPasswordParam->valueBuffer) > 0)
+                ? "******** (gesetzt - leer lassen zum Beibehalten)"
+                : "WICHTIG: leer! Bitte setzen, sonst bleibt das Geraet dauerhaft im Setup-Modus.";
+
+        iotWebConf.handleConfig();
+    });
     server.on("/values", handleValues);
     server.on("/debug", handleDebug);
     server.onNotFound([]() { iotWebConf.handleNotFound(); });
@@ -405,7 +562,14 @@ void setup() {
 }
 
 void loop() {
+    if (restartPending && (long)(millis() - restartAtMs) >= 0) {
+        Serial.println(F("[Config] Restarting now."));
+        delay(50);
+        ESP.restart();
+    }
+
     iotWebConf.doLoop();
+    logWifiStateChanges();
 
     if (WiFi.status() == WL_CONNECTED) {
         connectMqtt();
