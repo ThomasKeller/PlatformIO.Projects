@@ -222,6 +222,16 @@ private:
             return true;
         }
 
+        // Only Integer/Unsigned actually encode a number - anything else
+        // here (list, boolean, non-empty octet string) means malformed or
+        // unexpected input from the meter; reject rather than misinterpret
+        // arbitrary bytes as a value. Cap at 8 bytes: convertToImpl()
+        // accumulates into an int64_t, and shifting one by more than 8
+        // bytes' worth is undefined behavior.
+        if ((type != TYPE_INTEGER && type != TYPE_UNSIGNED) || dataBytes > 8) {
+            return false;
+        }
+
         isPresent = true;
         outValue = convertToImpl(data + pos + tlBytes, dataBytes, type == TYPE_INTEGER);
         pos += tlBytes + dataBytes;
