@@ -65,48 +65,18 @@ void test_addBytes_incomplete_no_measurement(void) {
 // ---------------------------------------------------------------------------
 // Test 6 – addBytes: crafted complete telegram parses correctly
 //
-// Telegram layout (299 bytes, same structure as test_data.h telegram 1):
-//   consumedEnergy1 = 1000.0 Wh  (raw 10000000, offset=10, numBytes=5)
-//   producedEnergy1 = 0.0    Wh
-//   consumedEnergy2 = 200.0  Wh  (raw  2000000, offset= 7, numBytes=5)
-//   producedEnergy2 = 0.0    Wh
-//   currentPower    = 100.0  W   (raw     1000, offset= 7, numBytes=4)
+// Telegram layout: SEQ_START + padding + valid SML_ListEntry TLVs for
+// SEQ_CONSUMED/SEQ_PRODUCED/SEQ_POWER (see test_data.h for the field-by-field
+// breakdown) + padding + SEQ_STOP + trailer (0x1A, padCount, CRC16-LE),
+// 299 bytes total (telegram 1 of TEST_STREAM_DATA):
+//   consumedEnergy = 1000.0 Wh  (raw=10000, scaler=-1)
+//   producedEnergy = 0.0    Wh  (raw=0,     scaler=-1)
+//   currentPower   = 100.0  W   (raw=100,   scaler absent -> 10^0)
 // ---------------------------------------------------------------------------
 void test_addBytes_crafted_message(void) {
-    // Build the telegram byte-by-byte matching test_data.h telegram 1.
     static const int TLEN = 299;
     uint8_t msg[TLEN];
-    memset(msg, 0, TLEN);
-
-    // SEQ_START  [0..7]
-    const uint8_t start[] = { 0x1B, 0x1B, 0x1B, 0x1B, 0x01, 0x01, 0x01, 0x01 };
-    for (int i = 0; i < 8; i++) msg[i] = start[i];
-
-    // SEQ_CONSUMED1  [58..65], skip 10, value at [76..80]
-    const uint8_t c1[] = { 0x77, 0x07, 0x01, 0x00, 0x01, 0x08, 0x00, 0xFF };
-    for (int i = 0; i < 8; i++) msg[58 + i] = c1[i];
-    msg[76] = 0x00; msg[77] = 0x00; msg[78] = 0x98; msg[79] = 0x96; msg[80] = 0x80;
-
-    // SEQ_PRODUCED1  [81..88], skip 10, value at [99..103] = all zero (0.0)
-    const uint8_t p1[] = { 0x77, 0x07, 0x01, 0x00, 0x02, 0x08, 0x00, 0xFF };
-    for (int i = 0; i < 8; i++) msg[81 + i] = p1[i];
-
-    // SEQ_CONSUMED2  [104..111], skip 7, value at [119..123]
-    const uint8_t c2[] = { 0x77, 0x07, 0x01, 0x00, 0x01, 0x08, 0x01, 0xFF };
-    for (int i = 0; i < 8; i++) msg[104 + i] = c2[i];
-    msg[119] = 0x00; msg[120] = 0x00; msg[121] = 0x1E; msg[122] = 0x84; msg[123] = 0x80;
-
-    // SEQ_PRODUCED2  [124..131], skip 7, value at [139..143] = all zero (0.0)
-    const uint8_t p2[] = { 0x77, 0x07, 0x01, 0x00, 0x02, 0x08, 0x01, 0xFF };
-    for (int i = 0; i < 8; i++) msg[124 + i] = p2[i];
-
-    // SEQ_POWER  [144..151], skip 7, value at [159..162]
-    const uint8_t pw[] = { 0x77, 0x07, 0x01, 0x00, 0x10, 0x07, 0x00, 0xFF };
-    for (int i = 0; i < 8; i++) msg[144 + i] = pw[i];
-    msg[159] = 0x00; msg[160] = 0x00; msg[161] = 0x03; msg[162] = 0xE8;
-
-    // SEQ_STOP  [295..298]
-    msg[295] = 0x1B; msg[296] = 0x1B; msg[297] = 0x1B; msg[298] = 0x1B;
+    memcpy(msg, TEST_STREAM_DATA, TLEN);  // telegram 1
 
     SmlParser parser;
     parser.addBytes(msg, TLEN);
@@ -115,11 +85,84 @@ void test_addBytes_crafted_message(void) {
 
     EhZMeasurement m = parser.getMeasurement();
     TEST_ASSERT_TRUE(m.valid);
-    TEST_ASSERT_EQUAL_DOUBLE(1000.0, m.consumedEnergy1);
-    TEST_ASSERT_EQUAL_DOUBLE(0.0,    m.producedEnergy1);
-    TEST_ASSERT_EQUAL_DOUBLE(200.0,  m.consumedEnergy2);
-    TEST_ASSERT_EQUAL_DOUBLE(0.0,    m.producedEnergy2);
+    TEST_ASSERT_EQUAL_DOUBLE(1000.0, m.consumedEnergy);
+    TEST_ASSERT_EQUAL_DOUBLE(0.0,    m.producedEnergy);
     TEST_ASSERT_EQUAL_DOUBLE(100.0,  m.currentPower);
+}
+
+// ---------------------------------------------------------------------------
+// Test 6b – addBytes: telegram without OBIS 16.7.0 (Leistung) is still valid
+//
+// Power is optional: a meter that never sends 16.7.0 must still produce a
+// valid measurement, with currentPower defaulting to 0.0. CRC16 covers
+// SEQ_START through the trailer's pad-count byte, same as a real telegram.
+// ---------------------------------------------------------------------------
+static const uint8_t NO_POWER_TELEGRAM[] = {
+    0x1B, 0x1B, 0x1B, 0x1B, 0x01, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x77, 0x07, 0x01, 0x00, 0x01,
+    0x08, 0x00, 0xFF, 0x01, 0x01, 0x62, 0x00, 0x52, 0xFF, 0x63, 0x27, 0x10,
+    0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x77,
+    0x07, 0x01, 0x00, 0x02, 0x08, 0x00, 0xFF, 0x01, 0x01, 0x62, 0x00, 0x52,
+    0xFF, 0x63, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x1B, 0x1B, 0x1B, 0x1B, 0x1A, 0x00, 0x99, 0x33
+};
+
+void test_addBytes_missing_power_still_valid(void) {
+    static const int TLEN = sizeof(NO_POWER_TELEGRAM);
+    uint8_t msg[TLEN];
+    memcpy(msg, NO_POWER_TELEGRAM, TLEN);
+
+    SmlParser parser;
+    parser.addBytes(msg, TLEN);
+
+    TEST_ASSERT_TRUE(parser.hasMeasurement());
+
+    EhZMeasurement m = parser.getMeasurement();
+    TEST_ASSERT_TRUE(m.valid);
+    TEST_ASSERT_EQUAL_DOUBLE(1000.0, m.consumedEnergy);
+    TEST_ASSERT_EQUAL_DOUBLE(0.0,    m.producedEnergy);
+    TEST_ASSERT_EQUAL_DOUBLE(0.0,    m.currentPower);
+}
+
+// ---------------------------------------------------------------------------
+// Test 6c – addBytes: a telegram with a corrupted payload byte (CRC16
+// mismatch) must be rejected rather than surfaced as a measurement -
+// this is what protects real telegrams from data loss that the
+// SoftwareSerial link can suffer under WiFi/CPU load.
+// ---------------------------------------------------------------------------
+void test_addBytes_bad_crc_rejected(void) {
+    static const int TLEN = 299;
+    uint8_t msg[TLEN];
+    memcpy(msg, TEST_STREAM_DATA, TLEN);  // telegram 1, otherwise valid
+    msg[100] ^= 0xFF;  // flip a payload byte well before the trailer/CRC
+
+    SmlParser parser;
+    unsigned long foundBefore = parser.telegramsFound();
+    unsigned long crcFailedBefore = parser.telegramsCrcFailed();
+
+    parser.addBytes(msg, TLEN);
+
+    TEST_ASSERT_FALSE(parser.hasMeasurement());
+    TEST_ASSERT_TRUE(parser.telegramsFound() == foundBefore + 1);
+    TEST_ASSERT_TRUE(parser.telegramsCrcFailed() == crcFailedBefore + 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -192,6 +235,8 @@ int main(int argc, char** argv) {
     RUN_TEST(test_convertTo_negative);
     RUN_TEST(test_addBytes_incomplete_no_measurement);
     RUN_TEST(test_addBytes_crafted_message);
+    RUN_TEST(test_addBytes_missing_power_still_valid);
+    RUN_TEST(test_addBytes_bad_crc_rejected);
     RUN_TEST(test_stream_file);
     return UNITY_END();
 }
