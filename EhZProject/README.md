@@ -28,6 +28,14 @@ interface, nothing needs to be connected there. Confirmed against the
 ESP8266 Arduino core's official `nodemcu` pin table, `D0..D10` map to
 GPIO `16,5,4,0,2,14,12,13,15,3,1` respectively.)
 
+### Status LED
+
+The onboard blue LED (D4/GPIO2) briefly flashes every time a telegram is
+successfully parsed (passes CRC and yields a valid measurement) — a quick
+visual "the meter link is alive" indicator without needing to open
+`/debug`. It's non-blocking (no `delay()`), so it never interferes with
+WiFi/MQTT/serial handling.
+
 The optical IR reader delivers 9600 baud, 8N1 TTL serial. Using hardware
 UART0 for the meter means the USB UART (`Serial`) is unavailable for debug
 text while the meter is connected — use `/debug` on the web UI instead,
@@ -78,6 +86,14 @@ monitor) to update WiFi or MQTT settings at any time. The device explicitly
 restarts itself ~1.5s after any save (not left to IotWebConf's own state
 machine, which isn't reliable to depend on for this) so the new settings are
 always applied cleanly.
+
+`/config` also has an **"Übertragungs-Einstellungen"** section with
+**"Sendeintervall Live-Werte (s)"** - the minimum interval between two
+publishes of `ehz/energy/consumed`, `ehz/energy/produced`, and
+`ehz/power/current` (see "Rate limiting" below). Range 5–300 seconds,
+default 15; out-of-range input is clamped on the device itself, not just
+rejected client-side. Does not affect the rolling-hourly topics, which
+always cover a fixed 60-minute window (see "Rolling hourly aggregates").
 
 ### If it won't join your WiFi
 
@@ -142,7 +158,15 @@ Values are retained on the broker.
 |-------------------------|------|---------|------------------------------|
 | `ehz/energy/consumed`   | kWh  | 1.8.0   | Consumed energy                |
 | `ehz/energy/produced`   | kWh  | 2.8.0   | Produced energy                |
-| `ehz/power/current`     | W    | 16.7.0  | Current active power (optional — defaults to 0 if the meter does not send it) |
+| `ehz/power/current`     | W    | 16.7.0  | Time-weighted average active power over the dead-band window since the previous publish (optional — defaults to 0 if the meter does not send it), see "Rate limiting" below |
+| `ehz/power/current/min` | W    | 16.7.0  | Minimum instantaneous power reading seen in that same interval |
+| `ehz/power/current/max` | W    | 16.7.0  | Maximum instantaneous power reading seen in that same interval |
+| `ehz/power/current/count` | –  | –       | Number of telegrams/readings folded into that interval's average/min/max |
+| `ehz/energy/consumed/hourly` | kWh | 1.8.0 | Consumed energy delta over the last rolling 60-minute window, see "Rolling hourly aggregates" below |
+| `ehz/energy/produced/hourly` | kWh | 2.8.0 | Produced energy delta over the last rolling 60-minute window |
+| `ehz/power/hourly/avg`  | W    | 16.7.0  | Time-weighted average power over the last rolling 60-minute window |
+| `ehz/power/hourly/min`  | W    | 16.7.0  | Minimum instantaneous power seen in the last rolling 60-minute window |
+| `ehz/power/hourly/max`  | W    | 16.7.0  | Maximum instantaneous power seen in the last rolling 60-minute window |
 
 ---
 
@@ -151,7 +175,7 @@ Values are retained on the broker.
 | Path       | Purpose                                                          |
 |------------|-------------------------------------------------------------------|
 | `/`        | Landing page with links to the pages below.                      |
-| `/values`  | Last 20 parsed measurements (device uptime at the reading, consumed/produced kWh, power W), auto-refreshes every 15s. Shows every reading the parser produces, independent of the MQTT dead-band. |
+| `/values`  | Last 20 parsed measurements (device uptime at the reading, consumed/produced kWh, power W), auto-refreshes every 15s. Shows every reading the parser produces, independent of the MQTT dead-band. Also lists the last 24 completed rolling-hourly windows (consumed/produced delta, average/min/max power), see "Rolling hourly aggregates". |
 | `/debug`   | WiFi/MQTT connection status, meter byte counter, telegram counters (found / CRC failed / valid), free heap, and a hex dump of the last ~300 raw bytes received from the meter. Auto-refreshes every 10s. |
 | `/config`  | WiFi/MQTT configuration form (see above).                         |
 
@@ -220,15 +244,84 @@ a corrupted-but-structurally-valid telegram could slip past. The
 SoftwareSerial RX buffer is also sized up from the library default of 64
 bytes to 256 to reduce how often that happens in the first place.
 
+### Other OBIS registers/fields present in the telegram but not parsed
+
+Decoded from a real capture (`tools/capture.txt`) of this device's meter (a
+Landis+Gyr EHZ), each `SML_ListEntry` in the telegram carries more than the
+three registers `SmlParser` currently extracts. None of these are exposed
+today; noted here so they don't need re-reverse-engineering later if a
+future need comes up:
+
+| OBIS / field | Meaning | Example value seen | Notes |
+|---|---|---|---|
+| `1-0:96.1.0*255` | Meter server-ID / serial number | `0A 01 4C 47 5A 00 05 58 28 97` (raw octet string, vendor-specific encoding) | Static - never changes |
+| `1-0:96.50.1*1` | Manufacturer ID | `"LGZ"` (Landis+Gyr) | Static - never changes |
+| Status (2nd field of every `SML_ListEntry`, not an OBIS-addressed register) | Device status/error bitmask | `0x001C7904` on this meter's 1.8.0 entry; absent (optional-not-set) on the 2.8.0 and 16.7.0 entries in the same telegram | Bit meanings are vendor-specific; would need Landis+Gyr documentation to decode meaningfully |
+| valTime/secIndex (3rd field) | Meter-internal seconds counter at the time of that reading | `0x0003C85A` | Relative to the meter's own clock, not wall time - the device has no NTP/RTC (see "Rolling hourly aggregates") |
+| `1-0:98.10.255*255` | SML list name (which named list this telegram represents) | structural, not a measurement | |
+
+`SmlParser::searchAndParse()` already generically skips over status/valTime/
+unit for whichever OBIS it's asked to find (see `skipElement()` in
+[SmlParser.h](include/SmlParser.h)), so reading any of these would mean
+adding a new `SEQ_*` byte pattern and either reusing `searchAndParse()` (for
+the status/serial octet-string values, `readNumeric()`'s octet-string
+handling would need extending since those aren't Integer/Unsigned fields)
+or a small dedicated decoder.
+
 ---
 
 ## Rate limiting (dead-band)
 
 To avoid flooding the broker, each value is subject to a dead-band:
 
-- **Minimum interval**: 15 seconds between any two publishes of the same topic.
+- **Minimum interval**: 15 seconds by default between any two publishes of
+  the same topic - configurable (5–300s) via `/config` → "Übertragungs-
+  Einstellungen" → "Sendeintervall Live-Werte (s)", see "Configuration"
+  above. Applies to `ehz/energy/consumed`, `ehz/energy/produced`, and
+  `ehz/power/current` only; the rolling-hourly topics below always use a
+  fixed 60-minute window regardless of this setting.
 - **Force publish**: even if the value has not changed, it is republished after
   10 minutes to confirm the reading is still live.
+- **`ehz/power/current` is a time-weighted average**, not the last-seen
+  instantaneous reading: every parsed measurement's power value is folded
+  into a running average (weighted by how long it held, i.e. the time since
+  the previous telegram), and that average is what gets published and used
+  for the dead-band's change check. The averaging window resets after each
+  publish, so it always covers exactly the interval since the previous
+  `ehz/power/current` message - smoothing out telegram-to-telegram jitter
+  instead of publishing whichever single reading happened to land on the
+  15s/10min tick. `ehz/energy/json`'s `currentPower` field uses the same
+  averaged value for consistency. `/values`, by contrast, still shows every
+  individual instantaneous reading, unaveraged.
+- **`ehz/power/current/min`, `/max`, `/count`** cover that same interval:
+  the lowest and highest instantaneous power reading seen, and how many
+  readings were folded in. Published alongside `ehz/power/current` (same
+  publish tick, same reset), so all four always describe the identical
+  window. A `count` of 1 means the dead-band fired on the very first
+  reading of a fresh window (e.g. right after startup or a long gap) - avg,
+  min, and max are then all equal to that single reading.
+
+---
+
+## Rolling hourly aggregates
+
+In addition to the dead-band-limited "live" topics above, `ehz/energy/*/hourly`
+and `ehz/power/hourly/*` report aggregates over a **rolling 60-minute
+window**: consumed/produced energy delta, and average/min/max power. Each
+window opens on the first measurement after boot (or after the previous
+window closed) and closes - publishing all five topics and opening the next
+window - once 60 minutes have elapsed.
+
+This window is a plain timer, **not aligned to the wall clock** (e.g. it
+won't land on 13:00, 14:00, ...): the device has no NTP/RTC time source, so
+"an hour" here means 60 minutes since the window last reset, which itself
+depends on when the device booted. If the broker is unreachable when a
+window closes, that hour's aggregate is simply dropped (not queued/retried)
+- the window still resets on schedule so the next one isn't oversized.
+
+These topics are **not retained** on the broker (unlike the live ones
+above), since a stale hourly aggregate from before a restart/disconnect
+would be misleading if picked up by a subscriber expecting a fresh value.
 
 ---
 

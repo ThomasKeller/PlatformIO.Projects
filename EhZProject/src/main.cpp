@@ -19,6 +19,8 @@
 #include "EhZMeasurement.h"
 #include "DeadBand.h"
 #include "MeasurementHistory.h"
+#include "HourlyHistory.h"
+#include "TimeWeightedAverage.h"
 
 // ---------------------------------------------------------------------------
 // IotWebConf identity / setup portal
@@ -31,7 +33,7 @@
 // ---------------------------------------------------------------------------
 const char THING_NAME[]                = "ehz-esp8266";
 const char WIFI_INITIAL_AP_PASSWORD[]  = "ehzsetup";
-#define CONFIG_VERSION "ehz2"  // bump when the parameter set/layout below changes
+#define CONFIG_VERSION "ehz3"  // bump when the parameter set/layout below changes
 
 #define MQTT_SERVER_LEN   128
 #define MQTT_PORT_LEN     8
@@ -65,13 +67,40 @@ IotWebConfCheckboxParameter debugTcpEnabledParam(
     "Roh-TCP-Debug (Port 8266) aktivieren", "debugTcpEnabled",
     debugTcpEnabledValue, DEBUG_TCP_ENABLED_LEN, false);
 
+// Minimum interval between two publishes of the same "live" topic
+// (ehz/energy/consumed, ehz/energy/produced, ehz/power/current) - see
+// DeadBand. Clamped server-side to [PUBLISH_INTERVAL_MIN_S,
+// PUBLISH_INTERVAL_MAX_S] in applyPublishInterval() regardless of what the
+// form posts, the HTML min/max/step below are just browser-side hints.
+#define PUBLISH_INTERVAL_LEN 5  // up to 3 digits ("300") + safety margin
+#define PUBLISH_INTERVAL_MIN_S 5
+#define PUBLISH_INTERVAL_MAX_S 300
+IotWebConfParameterGroup publishGroup("publish", "&Uuml;bertragungs-Einstellungen");
+char publishIntervalValue[PUBLISH_INTERVAL_LEN] = "15";
+IotWebConfNumberParameter publishIntervalParam(
+    "Sendeintervall Live-Werte (s)", "publishIntervalS",
+    publishIntervalValue, PUBLISH_INTERVAL_LEN, "15", "5..300",
+    "min='5' max='300' step='1'");
+
 // MQTT topics (values are published as plain ASCII numbers)
 #define TOPIC_STATUS     "ehz/status"
 #define TOPIC_CONSUMED   "ehz/energy/consumed"   // kWh
 #define TOPIC_PRODUCED   "ehz/energy/produced"   // kWh
-#define TOPIC_POWER      "ehz/power/current"     // W
+#define TOPIC_POWER      "ehz/power/current"     // W, time-weighted average over the interval
+#define TOPIC_POWER_MIN  "ehz/power/current/min"   // W, min instantaneous reading over the interval
+#define TOPIC_POWER_MAX  "ehz/power/current/max"   // W, max instantaneous reading over the interval
+#define TOPIC_POWER_COUNT "ehz/power/current/count" // number of readings folded into the interval
 #define TOPIC_JSON       "ehz/energy/json"
 #define TOPIC_UPTIME     "ehz/uptime/ms" // ms since epoch of the measurement
+
+// Rolling 60-minute window aggregates (window is a fixed timer since the
+// previous publish, not aligned to the wall clock - the device has no
+// NTP/RTC time source).
+#define TOPIC_CONSUMED_HOURLY  "ehz/energy/consumed/hourly"  // kWh, delta over the window
+#define TOPIC_PRODUCED_HOURLY  "ehz/energy/produced/hourly"  // kWh, delta over the window
+#define TOPIC_POWER_HOURLY_AVG "ehz/power/hourly/avg"        // W, time-weighted average
+#define TOPIC_POWER_HOURLY_MIN "ehz/power/hourly/min"        // W
+#define TOPIC_POWER_HOURLY_MAX "ehz/power/hourly/max"        // W
 
 // ---------------------------------------------------------------------------
 // Meter serial: hardware UART0 (D9=RX0/GPIO3, D10=TX0/GPIO1) is used by
@@ -93,6 +122,12 @@ IotWebConfCheckboxParameter debugTcpEnabledParam(
 // of FF/FE runs in the hex dump), flip this.
 #define METER_SERIAL_INVERTED false
 
+// Onboard blue LED (D4/GPIO2, active-LOW) - unused by anything else on this
+// board (see README), so it's free to use as a "still receiving valid
+// telegrams" indicator: briefly lit on every successfully parsed measurement.
+#define STATUS_LED_PIN 2
+#define STATUS_LED_BLINK_MS 80
+
 // ---------------------------------------------------------------------------
 // Globals
 // ---------------------------------------------------------------------------
@@ -111,10 +146,45 @@ MeasurementHistory<HISTORY_SIZE> history;
 // One dead-band instance per published value
 DeadBand dbConsumed, dbProduced, dbPower;
 
+// Time-weighted average of currentPower across each power dead-band window,
+// so TOPIC_POWER reflects the average load over the interval rather than
+// whichever instantaneous reading happened to land on the publish tick.
+// powerMin/powerMax/powerSampleCount track the same window's extremes and
+// sample count, for TOPIC_POWER_MIN/MAX/COUNT.
+TimeWeightedAverage powerAvg;
+double        powerMin         = 0.0;
+double        powerMax         = 0.0;
+unsigned long powerSampleCount = 0;
+
+// Rolling 60-minute aggregation window (see TOPIC_*_HOURLY above): a plain
+// timer since the last window reset, not aligned to the wall clock.
+static const unsigned long HOUR_WINDOW_MS = 3600000UL;  // 60 min
+bool          hourWindowOpen        = false;
+unsigned long hourWindowStartMs     = 0;
+double        hourStartConsumedKwh  = 0.0;
+double        hourStartProducedKwh  = 0.0;
+double        hourPowerMin          = 0.0;
+double        hourPowerMax          = 0.0;
+TimeWeightedAverage hourPowerAvg;
+
+static const int HOURLY_HISTORY_SIZE = 24;  // ~1 day at 60 min/window
+HourlyHistory<HOURLY_HISTORY_SIZE> hourlyHistory;
+
 unsigned long lastStatusMs  = 0;
 unsigned long lastMqttRetry = 0;
 static const unsigned long STATUS_INTERVAL_MS = 30000UL;
 static const unsigned long MQTT_RETRY_MS      = 5000UL;
+
+bool statusLedOn = false;
+unsigned long statusLedOffAtMs = 0;
+
+// Lights the status LED; loop() below turns it off again after
+// STATUS_LED_BLINK_MS without blocking.
+void flashStatusLed(unsigned long now) {
+    digitalWrite(STATUS_LED_PIN, LOW);  // active-LOW: on
+    statusLedOn = true;
+    statusLedOffAtMs = now + STATUS_LED_BLINK_MS;
+}
 
 // ---------------------------------------------------------------------------
 // Debug: raw-byte ring buffer (for /debug's hex dump) + raw TCP passthrough
@@ -167,16 +237,23 @@ void recordMeterByte(uint8_t b) {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-void publishFloat(const char* topic, double value) {
+void publishFloat(const char* topic, double value, bool retained = true) {
     char buf[24];
     dtostrf(value, 1, 4, buf);
-    if (!mqttClient.publish(topic, buf, /*retained=*/true)) {
+    if (!mqttClient.publish(topic, buf, retained)) {
         Serial.print(F("[MQTT] publish failed for topic: "));
         Serial.println(topic);
     }
 }
 
-void publishMeasurementJson(const EhZMeasurement& m) {
+void publishULong(const char* topic, unsigned long value, bool retained = true) {
+    if (!mqttClient.publish(topic, String(value).c_str(), retained)) {
+        Serial.print(F("[MQTT] publish failed for topic: "));
+        Serial.println(topic);
+    }
+}
+
+void publishMeasurementJson(const EhZMeasurement& m, double currentPower) {
     char payload[220];
 
     const char* t = "{\"consumedEnergy\":%.4f,"
@@ -184,11 +261,14 @@ void publishMeasurementJson(const EhZMeasurement& m) {
                "\"currentPower\":%.1f,"
                "\"valid\":%s}";
     // m.consumedEnergy/producedEnergy are in Wh (native SML unit); convert to
-    // kWh here to match the scalar topics.
+    // kWh here to match the scalar topics. currentPower is passed in
+    // separately (rather than read from m) since it's the dead-band-window
+    // average, not necessarily this particular telegram's instantaneous
+    // reading.
     int n = snprintf(payload, sizeof(payload), t,
         m.consumedEnergy / 1000.0,
         m.producedEnergy / 1000.0,
-        m.currentPower,
+        currentPower,
         m.valid ? "true" : "false");
 
     if (n <= 0 || n >= (int)sizeof(payload)) {
@@ -198,6 +278,73 @@ void publishMeasurementJson(const EhZMeasurement& m) {
     if (!mqttClient.publish(TOPIC_JSON, payload, true)) {
         Serial.println(F("[MQTT] publish failed for JSON topic"));
     }
+}
+
+// Updates the rolling 60-minute aggregation window with one new reading, and
+// publishes+resets it once HOUR_WINDOW_MS has elapsed since it opened. The
+// window itself always advances on schedule (even if MQTT is briefly down,
+// so it doesn't balloon into an oversized interval once reconnected); only
+// the publish step is skipped without a broker connection, so that hour's
+// aggregate is simply lost rather than queued.
+void updateHourlyAggregation(unsigned long now, double consumedKwh, double producedKwh, double power) {
+    if (!hourWindowOpen) {
+        hourWindowOpen       = true;
+        hourWindowStartMs    = now;
+        hourStartConsumedKwh = consumedKwh;
+        hourStartProducedKwh = producedKwh;
+        hourPowerMin         = power;
+        hourPowerMax         = power;
+        hourPowerAvg.reset(now, power);
+        return;
+    }
+
+    if (power < hourPowerMin) hourPowerMin = power;
+    if (power > hourPowerMax) hourPowerMax = power;
+    double avgPower = hourPowerAvg.sample(now, power);
+
+    if (now - hourWindowStartMs < HOUR_WINDOW_MS) return;
+
+    HourlyHistory<HOURLY_HISTORY_SIZE>::Entry entry = {
+        now,
+        consumedKwh - hourStartConsumedKwh,
+        producedKwh - hourStartProducedKwh,
+        avgPower,
+        hourPowerMin,
+        hourPowerMax,
+    };
+    hourlyHistory.push(entry);
+
+    if (mqttClient.connected()) {
+        // Not retained: a stale hourly aggregate from before a
+        // restart/disconnect would mislead a subscriber picking up a
+        // "current" value on connect.
+        publishFloat(TOPIC_CONSUMED_HOURLY, consumedKwh - hourStartConsumedKwh, false);
+        publishFloat(TOPIC_PRODUCED_HOURLY, producedKwh - hourStartProducedKwh, false);
+        publishFloat(TOPIC_POWER_HOURLY_AVG, avgPower, false);
+        publishFloat(TOPIC_POWER_HOURLY_MIN, hourPowerMin, false);
+        publishFloat(TOPIC_POWER_HOURLY_MAX, hourPowerMax, false);
+    }
+
+    hourWindowStartMs    = now;
+    hourStartConsumedKwh = consumedKwh;
+    hourStartProducedKwh = producedKwh;
+    hourPowerMin         = power;
+    hourPowerMax         = power;
+    hourPowerAvg.reset(now, power);
+}
+
+// Applies publishIntervalValue (from /config) to the three "live" topics'
+// dead-bands, clamping server-side since the form's min/max/step are only
+// browser-side hints - called once at boot and whenever the config portal
+// saves.
+void applyPublishInterval() {
+    long seconds = atol(publishIntervalValue);
+    if (seconds < PUBLISH_INTERVAL_MIN_S) seconds = PUBLISH_INTERVAL_MIN_S;
+    if (seconds > PUBLISH_INTERVAL_MAX_S) seconds = PUBLISH_INTERVAL_MAX_S;
+    unsigned long intervalMs = (unsigned long)seconds * 1000UL;
+    dbConsumed.timeDeadBandMs = intervalMs;
+    dbProduced.timeDeadBandMs = intervalMs;
+    dbPower.timeDeadBandMs    = intervalMs;
 }
 
 // Called by IotWebConf right after new settings are persisted to EEPROM.
@@ -216,6 +363,7 @@ void configSaved() {
     mqttClient.disconnect();
     mqttClient.setServer(mqttServerValue, atoi(mqttPortValue));
     updateRawTcpServerState();
+    applyPublishInterval();
     restartPending = true;
     restartAtMs = millis() + 1500;
 }
@@ -415,6 +563,32 @@ void handleValues() {
         page += "</table>";
     }
     page += "</div>";
+
+    page += "<div class='card'><h1>Stundenwerte (rollierendes 60-Min-Fenster)</h1>";
+    if (hourlyHistory.count() == 0) {
+        page += "<p class='muted'>Noch kein Stundenfenster abgeschlossen.</p>";
+    } else {
+        page += "<table><tr><th>Fensterende (Uptime, s)</th>"
+                "<th class='num'>Verbrauch &Delta; (kWh)</th>"
+                "<th class='num'>Einspeisung &Delta; (kWh)</th>"
+                "<th class='num'>Leistung &Oslash; (W)</th>"
+                "<th class='num'>Leistung Min (W)</th>"
+                "<th class='num'>Leistung Max (W)</th></tr>";
+        char row[260];
+        for (int i = 0; i < hourlyHistory.count(); i++) {
+            const HourlyHistory<HOURLY_HISTORY_SIZE>::Entry& e = hourlyHistory.get(i);
+            unsigned long uptimeS = e.windowEndUptimeMs / 1000UL;
+            snprintf(row, sizeof(row),
+                "<tr><td>%lu</td><td class='num'>%.3f</td><td class='num'>%.3f</td>"
+                "<td class='num'>%.1f</td><td class='num'>%.1f</td><td class='num'>%.1f</td></tr>",
+                uptimeS, e.consumedDeltaKwh, e.producedDeltaKwh,
+                e.avgPowerW, e.minPowerW, e.maxPowerW);
+            page += row;
+        }
+        page += "</table>";
+    }
+    page += "</div>";
+
     page += htmlFoot();
     server.send(200, "text/html; charset=utf-8", page);
 }
@@ -499,6 +673,9 @@ void setup() {
     WiFi.persistent(false);
     WiFi.disconnect(true);
 
+    pinMode(STATUS_LED_PIN, OUTPUT);
+    digitalWrite(STATUS_LED_PIN, HIGH);  // active-LOW: off
+
 #ifdef USE_HARDWARE_SERIAL
     // UART0 is used for debug; switch meter to UART0 means no debug output
     // (use /debug on the web UI instead while testing this mode).
@@ -519,10 +696,13 @@ void setup() {
     mqttGroup.addItem(&mqttUserParam);
     mqttGroup.addItem(&mqttPasswordParam);
     iotWebConf.addParameterGroup(&mqttGroup);
+    publishGroup.addItem(&publishIntervalParam);
+    iotWebConf.addParameterGroup(&publishGroup);
     debugGroup.addItem(&debugTcpEnabledParam);
     iotWebConf.addParameterGroup(&debugGroup);
     iotWebConf.setConfigSavedCallback(&configSaved);
     iotWebConf.init();
+    applyPublishInterval();
 
     server.on("/", handleRoot);
     server.on("/config", [] {
@@ -605,38 +785,71 @@ void loop() {
 
         if (m.valid) {
             history.push(m, now);
-        }
-
-        if (m.valid && mqttClient.connected()) {
-            double diff = 0.0;
-            bool publishedAny = false;
+            flashStatusLed(now);
 
             // m.consumedEnergy/producedEnergy are in Wh (native SML unit);
             // the scalar topics are documented/published in kWh.
             double consumedKwh = m.consumedEnergy / 1000.0;
             double producedKwh = m.producedEnergy / 1000.0;
 
-            if (dbConsumed.addValue(now, consumedKwh, diff)) {
-                publishFloat(TOPIC_CONSUMED, consumedKwh);
-                publishedAny = true;
-            }
-            if (dbProduced.addValue(now, producedKwh, diff)) {
-                publishFloat(TOPIC_PRODUCED, producedKwh);
-                publishedAny = true;
-            }
-            if (dbPower.addValue(now, m.currentPower, diff)) {
-                publishFloat(TOPIC_POWER, m.currentPower);
-                publishedAny = true;
-            }
-            if (publishedAny) {
-                publishMeasurementJson(m);
-                mqttClient.publish(TOPIC_UPTIME, String(now).c_str(), true);
+            updateHourlyAggregation(now, consumedKwh, producedKwh, m.currentPower);
+
+            if (mqttClient.connected()) {
+                double diff = 0.0;
+                bool publishedAny = false;
+
+                // Extend the running time-weighted average with this
+                // reading; avgPower is the average over the whole window
+                // since the last power publish (or the instantaneous value
+                // if this is the first sample of a fresh window). Track the
+                // window's min/max/sample-count alongside it.
+                double avgPower = powerAvg.sample(now, m.currentPower);
+                if (powerSampleCount == 0) {
+                    powerMin = m.currentPower;
+                    powerMax = m.currentPower;
+                } else {
+                    if (m.currentPower < powerMin) powerMin = m.currentPower;
+                    if (m.currentPower > powerMax) powerMax = m.currentPower;
+                }
+                powerSampleCount++;
+
+                if (dbConsumed.addValue(now, consumedKwh, diff)) {
+                    publishFloat(TOPIC_CONSUMED, consumedKwh);
+                    publishedAny = true;
+                }
+                if (dbProduced.addValue(now, producedKwh, diff)) {
+                    publishFloat(TOPIC_PRODUCED, producedKwh);
+                    publishedAny = true;
+                }
+                if (dbPower.addValue(now, avgPower, diff)) {
+                    publishFloat(TOPIC_POWER, avgPower);
+                    publishFloat(TOPIC_POWER_MIN, powerMin);
+                    publishFloat(TOPIC_POWER_MAX, powerMax);
+                    publishULong(TOPIC_POWER_COUNT, powerSampleCount);
+                    publishedAny = true;
+                    // Start a fresh averaging window for the next interval;
+                    // this reading is already the first sample of it.
+                    powerAvg.reset(now, m.currentPower);
+                    powerMin = m.currentPower;
+                    powerMax = m.currentPower;
+                    powerSampleCount = 1;
+                }
+                if (publishedAny) {
+                    publishMeasurementJson(m, avgPower);
+                    mqttClient.publish(TOPIC_UPTIME, String(now).c_str(), true);
+                }
             }
         }
     }
 
-    // Periodic status print
     unsigned long now = millis();
+
+    if (statusLedOn && (long)(now - statusLedOffAtMs) >= 0) {
+        digitalWrite(STATUS_LED_PIN, HIGH);  // active-LOW: off
+        statusLedOn = false;
+    }
+
+    // Periodic status print
     if (now - lastStatusMs >= STATUS_INTERVAL_MS) {
         lastStatusMs = now;
         Serial.print(F("[EhZ] uptime="));
