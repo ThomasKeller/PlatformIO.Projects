@@ -49,17 +49,18 @@ working, at the cost of the higher CRC failure rate measured above.
 ### Signal inversion
 
 Many DIY IR read heads (phototransistor + pull-up) output an **inverted**
-signal relative to normal TTL UART. That's the default assumption here:
+signal relative to normal TTL UART. The read head used with this project
+delivers a normal (non-inverted) signal, so the default is:
 
 ```cpp
-#define METER_SERIAL_INVERTED true   // src/main.cpp
+#define METER_SERIAL_INVERTED false   // src/main.cpp
 ```
 
 **Symptom of getting this wrong:** `/debug` shows a nonzero meter byte
 counter but 0 telegrams found, and the raw hex dump (or
 `tools/raw_monitor.ps1`) never contains the `1B 1B 1B 1B` SML start
 sequence — just repeated `FF`/`FE`-ish runs instead. Flip the define to
-`false` if your specific read head turns out not to be inverted.
+`true` if your read head turns out to be inverted.
 
 (Tasmota's `sensor53` meter driver supports the same concept via the
 `=so2 4` script command, for comparison if you're cross-testing with it.)
